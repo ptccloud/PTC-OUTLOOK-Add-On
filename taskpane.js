@@ -1,0 +1,414 @@
+/* global Office, document */
+
+Office.onReady((info) => {
+    if (info.host === Office.HostType.Outlook) {
+        try {
+            loadItemData();
+            document.getElementById("btnVerify").onclick = markAsVerified;
+
+            // 1. 註冊事件監聽 (收件者與附件可即時同步)
+            const item = Office.context.mailbox.item;
+            item.addHandlerAsync(Office.EventType.RecipientsChanged, onMessageChanged);
+            item.addHandlerAsync(Office.EventType.AttachmentsChanged, onMessageChanged);
+
+            // 2. 設定輪詢 (每 3 秒同步主旨與內容)
+            setInterval(pollForChanges, 3000);
+
+        } catch (e) {
+            logError("Init Error: " + e.message);
+        }
+    }
+});
+
+let lastSeenState = null;
+
+async function pollForChanges() {
+    const currentState = await getCurrentState();
+    if (!lastSeenState) {
+        lastSeenState = currentState;
+        return;
+    }
+
+    // 比對是否有任何變動 (主旨、內容、收件者、附件)
+    const isDifferent = (
+        currentState.recipients !== lastSeenState.recipients ||
+        currentState.attachments !== lastSeenState.attachments ||
+        currentState.subject !== lastSeenState.subject ||
+        currentState.bodyFingerprint !== lastSeenState.bodyFingerprint
+    );
+
+    if (isDifferent) {
+        console.log("Detected change via polling, refreshing...");
+        lastSeenState = currentState;
+        onMessageChanged();
+    }
+}
+
+function onMessageChanged() {
+    // When recipients or attachments change, reset verification and reload
+    Office.context.mailbox.item.loadCustomPropertiesAsync((result) => {
+        const props = result.value;
+        props.set("isVerified", false);
+        props.saveAsync(() => {
+            // Re-show verification area and reload data
+            document.getElementById("btn-area").style.display = "block";
+            document.getElementById("status-msg").style.display = "none";
+            loadItemData();
+        });
+    });
+}
+
+function logError(msg) {
+    const el = document.getElementById("error-log");
+    el.style.display = "block";
+    el.innerText += "❌ " + msg + "\n";
+    console.error(msg);
+}
+
+function getDomain(email) {
+    if (!email || typeof email !== 'string') return "unknown";
+    if (!email.includes("@")) return "unknown";
+    return email.split("@")[1].toLowerCase().trim();
+}
+
+function loadItemData() {
+    const item = Office.context.mailbox.item;
+
+    if (!item) {
+        logError("Unable to read mail object (Item is null)");
+        return;
+    }
+
+    const safeGet = (apiCall) => new Promise(resolve => {
+        try {
+            apiCall(result => {
+                if (result.status === Office.AsyncResultStatus.Succeeded) {
+                    resolve(result.value);
+                } else {
+                    console.warn("API Failed:", result.error);
+                    resolve(null);
+                }
+            });
+        } catch (e) {
+            console.error("API Call Error:", e);
+            resolve(null);
+        }
+    });
+
+    // 重新加入附件讀取
+    Promise.all([
+        safeGet(cb => item.from.getAsync(cb)),
+        safeGet(cb => item.to.getAsync(cb)),
+        safeGet(cb => item.cc.getAsync(cb)),
+        safeGet(cb => item.bcc.getAsync(cb)),
+        safeGet(cb => item.getAttachmentsAsync(cb)),
+        safeGet(cb => item.subject.getAsync(cb)),
+        safeGet(cb => item.body.getAsync(Office.CoercionType.Html, cb))
+    ]).then(([from, to, cc, bcc, attachments, subject, htmlBody]) => {
+
+        to = to || [];
+        cc = cc || [];
+        bcc = bcc || [];
+        attachments = attachments || [];
+
+        // Render Subject
+        document.getElementById("subject-container").innerText = subject || "(No Subject)";
+
+        // 解析 HTML 內容
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(htmlBody || "", 'text/html');
+
+        // 移除所有的 style 與 script 標籤，避免其內容被 innerText 當成純文字讀取出來
+        doc.querySelectorAll('style, script').forEach(el => el.remove());
+
+        // 1. 偵測內文中的連結 (可能是雲端附件)
+        const detectedLinks = [];
+        const fileExtensions = ['svg', 'pdf', 'docx', 'xlsx', 'pptx', 'zip', 'rar', '7z', 'png', 'jpg', 'jpeg', 'gif'];
+
+        doc.querySelectorAll('a').forEach(a => {
+            const text = a.innerText.trim();
+            const href = a.getAttribute('href') || "";
+            const isFile = fileExtensions.some(ext => text.toLowerCase().endsWith('.' + ext) || href.toLowerCase().includes('.' + ext));
+
+            if (isFile && text) {
+                detectedLinks.push({
+                    name: text,
+                    size: 0,
+                    id: href,
+                    isDetected: true
+                });
+            }
+        });
+
+        // 2. 取得乾淨文字內容 (用於內容檢查區)
+        // 移除這些被偵測為檔案的節點
+        doc.querySelectorAll('a').forEach(a => {
+            const text = a.innerText.trim();
+            if (fileExtensions.some(ext => text.toLowerCase().endsWith('.' + ext))) {
+                a.remove();
+            }
+        });
+
+        const cleanText = doc.body.innerText.trim();
+        document.getElementById("body-container").innerText = cleanText || "(No Content)";
+
+        // 3. 整合附件清單
+        const finalAttachments = [...attachments, ...detectedLinks];
+
+        const senderEmail = (from && from.emailAddress) ? from.emailAddress : "";
+        const senderDomain = getDomain(senderEmail);
+
+        renderSender("from-container", from);
+        renderGroupedList("to-list", to, senderDomain);
+        renderGroupedList("cc-list", cc, senderDomain);
+        renderGroupedList("bcc-list", bcc, senderDomain);
+
+        // 執行附件渲染 (使用整合後的清單)
+        renderAttachments("attachment-list", finalAttachments);
+
+        checkAllChecked();
+
+        // 更新最後看到的狀態快照，避免輪詢立即觸發
+        getCurrentState().then(state => {
+            lastSeenState = state;
+        });
+
+    }).catch(err => {
+        logError("Load Data Error: " + err.message);
+    });
+}
+
+function renderSender(containerId, data) {
+    const container = document.getElementById(containerId);
+    if (!data) {
+        container.innerHTML = "<div class='empty-msg'>Sender info loading or not set</div>";
+        return;
+    }
+    container.innerHTML = `
+        <div class="safe-icon">👤</div>
+        <div class="item-content">
+            <div class="name">${data.displayName || data.emailAddress}</div>
+            <div class="email">${data.emailAddress}</div>
+        </div>
+    `;
+}
+
+function renderGroupedList(containerId, dataArray, senderDomain) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = "";
+
+    if (!dataArray || dataArray.length === 0) {
+        container.innerHTML = "<div class='empty-msg'>(None)</div>";
+        return;
+    }
+
+    const groups = {};
+    dataArray.forEach(p => {
+        const domain = getDomain(p.emailAddress);
+        if (!groups[domain]) groups[domain] = [];
+        groups[domain].push(p);
+    });
+
+    // 排序：External 排前面
+    const sortedDomains = Object.keys(groups).sort((a, b) => {
+        const aIsExt = a !== senderDomain;
+        const bIsExt = b !== senderDomain;
+        return bIsExt - aIsExt;
+    });
+
+    sortedDomains.forEach(domain => {
+        const isExternal = domain !== senderDomain;
+        const recipients = groups[domain];
+
+        const groupDiv = document.createElement("div");
+        groupDiv.className = "domain-group";
+
+        const headerDiv = document.createElement("div");
+        headerDiv.className = "domain-header";
+
+        const tagHtml = isExternal
+            ? `<span class="tag external">External</span>`
+            : `<span class="tag internal">Internal</span>`;
+
+        // 將勾選框移至 Header
+        const checkedState = isExternal ? "" : "checked";
+        headerDiv.innerHTML = `
+            <div style="display: flex; align-items: center;">
+                <input type='checkbox' class='verify-check' ${checkedState} onchange='checkAllChecked()'>
+                <span>@${domain}</span>
+            </div>
+            ${tagHtml}
+        `;
+        groupDiv.appendChild(headerDiv);
+
+        recipients.forEach((p, i) => {
+            const rowDiv = document.createElement("div");
+            rowDiv.className = "item-row";
+
+            // 移除個別勾選框，並依賴 CSS 的 padding 縮進
+            rowDiv.innerHTML = `
+                <div class="item-content">
+                    <div class="name">${p.displayName || p.emailAddress}</div>
+                    <div class="email">${p.emailAddress}</div>
+                </div>
+            `;
+            groupDiv.appendChild(rowDiv);
+        });
+
+        container.appendChild(groupDiv);
+    });
+}
+
+// 移除 renderAttachments 函式
+
+window.checkAllChecked = function () {
+    const allCheckboxes = document.querySelectorAll(".verify-check");
+    let pass = true;
+
+    if (allCheckboxes.length === 0) {
+        pass = true;
+    } else {
+        allCheckboxes.forEach(c => {
+            if (!c.checked) pass = false;
+        });
+    }
+
+    if (pass) enableButton();
+    else disableButton();
+};
+
+function enableButton() {
+    const btn = document.getElementById("btnVerify");
+    btn.disabled = false;
+    btn.classList.add("active");
+    btn.innerText = "Verify information";
+}
+
+function disableButton() {
+    const btn = document.getElementById("btnVerify");
+    btn.disabled = true;
+    btn.classList.remove("active");
+
+    const all = document.querySelectorAll(".verify-check");
+    let uncheckCount = 0;
+    all.forEach(c => { if (!c.checked) uncheckCount++; });
+
+    btn.innerText = uncheckCount > 0 ? `${uncheckCount} items left to verify` : "Please check all items...";
+}
+
+async function getCurrentState() {
+    const item = Office.context.mailbox.item;
+    const safeGet = (apiCall) => new Promise(resolve => {
+        try {
+            apiCall(result => resolve(result.status === Office.AsyncResultStatus.Succeeded ? result.value : null));
+        } catch (e) {
+            resolve(null);
+        }
+    });
+
+    const [to, cc, bcc, attachments, subject, body] = await Promise.all([
+        safeGet(cb => item.to.getAsync(cb)),
+        safeGet(cb => item.cc.getAsync(cb)),
+        safeGet(cb => item.bcc.getAsync(cb)),
+        safeGet(cb => item.getAttachmentsAsync(cb)),
+        safeGet(cb => item.subject.getAsync(cb)),
+        safeGet(cb => item.body.getAsync(Office.CoercionType.Text, cb))
+    ]);
+
+    const getEmails = (arr) => (arr || []).map(p => p.emailAddress.toLowerCase()).sort().join(";");
+    const getAtts = (arr) => (arr || []).map(a => a.name + a.size).sort().join(";");
+
+    // Simple fingerprint for body to detect changes without storing huge strings
+    const bodyFingerprint = body ? `${body.length}_${body.substring(0, 50)}` : "empty";
+
+    return {
+        recipients: `to:${getEmails(to)}|cc:${getEmails(cc)}|bcc:${getEmails(bcc)}`,
+        attachments: getAtts(attachments),
+        subject: subject || "",
+        bodyFingerprint: bodyFingerprint
+    };
+}
+
+async function markAsVerified() {
+    const state = await getCurrentState();
+
+    Office.context.mailbox.item.loadCustomPropertiesAsync((result) => {
+        const props = result.value;
+        props.set("isVerified", true);
+        props.set("verifiedState", JSON.stringify(state));
+
+        props.saveAsync((saveResult) => {
+            if (saveResult.status === Office.AsyncResultStatus.Succeeded) {
+                document.getElementById("btn-area").style.display = "none";
+                document.getElementById("status-msg").style.display = "block";
+            } else {
+                logError("Save failed: " + saveResult.error.message);
+            }
+        });
+    });
+}
+
+function getFileIcon(filename) {
+    if (!filename) return "assets/ic_file.svg";
+    const ext = filename.split('.').pop().toLowerCase();
+
+    // File Type Mapping (SVG)
+    switch (ext) {
+        case 'ai': return "assets/ic_ai.svg";
+        case 'csv': case 'xls': case 'xlsx': return "assets/ic_csv.svg";
+        case 'pdf': return "assets/ic_pdf.svg";
+        case 'txt': case 'log': case 'md': case 'rtf': return "assets/ic_txt.svg";
+        case 'mp3': case 'wav': case 'ogg': return "assets/ic_audio.svg";
+        case 'exe': case 'msi': return "assets/ic_exe.svg";
+        case 'ppt': case 'pptx': return "assets/ic_ppt.svg";
+        case 'mp4': case 'mov': case 'avi': case 'mkv': return "assets/ic_video.svg";
+        case 'js': case 'html': case 'css': case 'json': case 'xml': case 'ts': return "assets/ic_code.svg";
+        case 'fig': return "assets/ic_fig.svg";
+        case 'jpg': case 'jpeg': case 'png': case 'gif': case 'bmp': case 'svg': return "assets/ic_img.svg";
+        case 'rar': return "assets/ic_rar.svg";
+        case 'zip': case '7z': case 'tar': case 'gz': return "assets/ic_zip.svg";
+        default: return "assets/ic_file.svg";
+    }
+}
+
+function renderAttachments(containerId, attachments) {
+    const container = document.getElementById(containerId);
+    container.innerHTML = "";
+
+    if (!attachments || attachments.length === 0) {
+        container.innerHTML = "<div class='empty-msg'>(No Attachments)</div>";
+        return;
+    }
+
+    // 建立附件區塊的 Header (包含全選勾選框)
+    const headerDiv = document.createElement("div");
+    headerDiv.className = "domain-header"; // 延用 domain-header 的樣式
+    headerDiv.innerHTML = `
+        <div style="display: flex; align-items: center;">
+            <input type='checkbox' class='verify-check' onchange='checkAllChecked()'>
+            <span>Check All Attachments</span>
+        </div>
+        <span class="tag internal" style="background:#e0e0e0; color:#666;">${attachments.length} files</span>
+    `;
+    container.appendChild(headerDiv);
+
+    attachments.forEach((att, i) => {
+        const rowDiv = document.createElement("div");
+        rowDiv.className = "item-row";
+        rowDiv.style.paddingLeft = "30px"; // 讓內容縮排，對齊 Header 的文字
+
+        const iconPath = getFileIcon(att.name);
+        const typeTag = att.isDetected ? `<span class="tag internal" style="font-size:8px; margin-left:5px;">Content</span>` : "";
+
+        // 移除個別勾選框，改為單純顯示資訊
+        rowDiv.innerHTML = `
+            <div class="item-content">
+                <div class="name">
+                    ${att.name} ${typeTag}
+                </div>
+                <div class="email">${att.isDetected ? "Link to OneDrive" : (att.size / 1024).toFixed(1) + " KB"}</div>
+            </div>
+        `;
+        container.appendChild(rowDiv);
+    });
+}
